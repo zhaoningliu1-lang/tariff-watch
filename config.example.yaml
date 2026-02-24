@@ -1,0 +1,36 @@
+# Copy this file to config.yaml and fill in your values.
+# DO NOT commit config.yaml — it is in .gitignore.
+
+mode: tracked_only   # tracked_only | full_table
+
+# List of 10-digit HTS codes to monitor (used when mode=tracked_only)
+tracked_hts:
+  - "8471300000"
+  - "8542310000"
+  - "9403200010"
+
+sources:
+  # Obtain the direct CSV/JSON export URL from:
+  # https://hts.usitc.gov/  ->  "Export/Download" or the Open Data portal.
+  # See README.md for step-by-step instructions.
+  usitc_hts_export_url: "https://PLACEHOLDER.example.com/hts_export.csv"
+
+storage:
+  snapshots_dir: snapshots
+  reports_dir: reports
+  retain_weeks: 12
+
+notify_email:
+  enabled: false          # set to true to enable SMTP email delivery
+  smtp_host: "ENV:SMTP_HOST"
+  smtp_port: 587
+  smtp_user: "ENV:SMTP_USER"
+  smtp_password: "ENV:SMTP_PASS"
+  from_email: "ENV:FROM_EMAIL"
+  to_emails:
+    - "recipient@example.com"
+  subject_prefix: "[Tariff Watch]"
+
+runtime:
+  timezone: "America/Los_Angeles"
+  log_level: INFO

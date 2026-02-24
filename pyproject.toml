@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tariff-watch"
+version = "0.1.0"
+description = "US Tariff Weekly Monitor — fetches USITC HTS data, diffs snapshots, generates reports and Telegram-ready summaries."
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31",
+    "pandas>=2.1",
+    "pyyaml>=6.0",
+    "python-dateutil>=2.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "requests-mock>=1.11",
+    "pandas-stubs>=2.0",
+]
+
+[project.scripts]
+tariff-watch = "tariff_watch.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["tariff_watch*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

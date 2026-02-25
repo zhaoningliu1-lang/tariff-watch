@@ -250,6 +250,7 @@ def fetch_hts_dataframe(cfg: AppConfig) -> pd.DataFrame:
 
 # ── Live lookup cache ─────────────────────────────────────────────────────────
 
+import math as _math
 import time as _time
 
 _cache_df: pd.DataFrame | None = None
@@ -307,5 +308,9 @@ def fetch_live_rates(hts_prefix: str) -> list[dict]:
 
     mask = df["_hts_norm"].str.startswith(hts_prefix, na=False)
     matched = df.loc[mask, OUTPUT_COLUMNS].copy()
-    matched = matched.where(matched.notna(), None)
-    return matched.to_dict(orient="records")
+    records = matched.to_dict(orient="records")
+    # Replace float NaN with None so the result is JSON-serialisable
+    return [
+        {k: None if (isinstance(v, float) and _math.isnan(v)) else v for k, v in row.items()}
+        for row in records
+    ]

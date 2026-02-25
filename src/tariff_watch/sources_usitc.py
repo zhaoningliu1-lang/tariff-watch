@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 from typing import TYPE_CHECKING
 
 import pandas as pd
@@ -16,6 +17,51 @@ if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
+
+# USITC REST API — stable endpoint that returns the list of all HTS releases.
+_RELEASE_LIST_URL = "https://hts.usitc.gov/reststop/releaseList"
+# CSV file URL template; year and revision number are substituted at runtime.
+_CSV_URL_TEMPLATE = "https://www.usitc.gov/tata/hts/hts_{year}_revision_{rev}_csv.csv"
+
+
+def discover_usitc_csv_url() -> str | None:
+    """Auto-discover the latest USITC HTS CSV export URL.
+
+    Calls ``/reststop/releaseList`` on hts.usitc.gov to find the release
+    whose ``status`` is ``"current"``, then derives the CSV download URL
+    from the release name (e.g. ``2026HTSRev3`` → year=2026, rev=3).
+
+    Returns:
+        A fully-qualified ``https://`` URL string, or ``None`` if discovery
+        fails (network error, unexpected name format, etc.).
+    """
+    try:
+        resp = http_get(_RELEASE_LIST_URL)
+        releases: list[dict] = resp.json()
+    except Exception as exc:
+        logger.warning("discover_usitc_csv_url: could not fetch release list: %s", exc)
+        return None
+
+    current = next(
+        (r for r in releases if isinstance(r, dict) and r.get("status") == "current"),
+        None,
+    )
+    if current is None:
+        logger.warning("discover_usitc_csv_url: no 'current' release found in list.")
+        return None
+
+    name: str = current.get("name", "")
+    # Expected format: "2026HTSRev3"  or  "2026HTSBasic"
+    m = re.match(r"^(\d{4})HTS(?:Rev(\d+)|Basic)$", name)
+    if not m:
+        logger.warning("discover_usitc_csv_url: unrecognised release name %r", name)
+        return None
+
+    year = m.group(1)
+    rev = m.group(2) or "0"   # "Basic" edition treated as revision 0
+    url = _CSV_URL_TEMPLATE.format(year=year, rev=rev)
+    logger.info("discover_usitc_csv_url: current release=%r → %s", name, url)
+    return url
 
 # Canonical output columns. Sources may not supply all of them.
 OUTPUT_COLUMNS = [
@@ -153,13 +199,27 @@ def fetch_hts_dataframe(cfg: AppConfig) -> pd.DataFrame:
         NetworkError: download failure.
         ParseError: CSV cannot be parsed.
     """
-    url = cfg.sources.usitc_hts_export_url.strip()
-    if not url or "PLACEHOLDER" in url:
+    url = cfg.sources.usitc_hts_export_url.strip() if cfg.sources.usitc_hts_export_url else ""
+
+    # Always try auto-discovery first — it ensures we get the latest revision
+    # even if config.yaml still points to an older one.
+    discovered = discover_usitc_csv_url()
+    if discovered:
+        if discovered != url:
+            logger.info(
+                "Auto-discovered newer USITC CSV URL: %s  (config has: %s)",
+                discovered,
+                url or "(empty)",
+            )
+        url = discovered
+    elif not url or "PLACEHOLDER" in url:
         raise ConfigError(
-            "sources.usitc_hts_export_url is not configured. "
-            "Please obtain the CSV export URL from https://hts.usitc.gov/ "
+            "sources.usitc_hts_export_url is not configured and auto-discovery "
+            "failed.  Please obtain the CSV export URL from https://hts.usitc.gov/ "
             "and set it in config.yaml. See README.md for instructions."
         )
+    else:
+        logger.info("Auto-discovery failed — falling back to config URL: %s", url)
 
     logger.info("Downloading HTS export from %s", url)
     try:
@@ -186,3 +246,66 @@ def fetch_hts_dataframe(cfg: AppConfig) -> pd.DataFrame:
         df = filter_tracked_hts(df, cfg.tracked_hts)
 
     return df
+
+
+# ── Live lookup cache ─────────────────────────────────────────────────────────
+
+import time as _time
+
+_cache_df: pd.DataFrame | None = None
+_cache_ts: float = 0.0
+_CACHE_TTL_SECONDS = 3600  # refresh at most every hour
+
+
+def _get_cached_full_df() -> pd.DataFrame | None:
+    """Return a cached full-table DataFrame, downloading it if needed.
+
+    Returns ``None`` on any failure so callers can degrade gracefully.
+    """
+    global _cache_df, _cache_ts
+
+    now = _time.monotonic()
+    if _cache_df is not None and (now - _cache_ts) < _CACHE_TTL_SECONDS:
+        return _cache_df
+
+    url = discover_usitc_csv_url()
+    if not url:
+        return None
+
+    logger.info("Live cache miss — downloading full HTS table from %s", url)
+    try:
+        resp = http_get(url)
+        text = resp.content.decode("utf-8-sig")
+        df = pd.read_csv(io.StringIO(text), dtype=str, low_memory=False)
+        df = _rename_columns(df)
+        df = normalize_dataframe(df)
+        df["_hts_norm"] = df["hts_code"].map(normalize_hts_code)
+        _cache_df = df
+        _cache_ts = now
+        logger.info("Live cache populated: %d rows", len(df))
+        return df
+    except Exception as exc:
+        logger.warning("Live cache download failed: %s", exc)
+        return None
+
+
+def fetch_live_rates(hts_prefix: str) -> list[dict]:
+    """Query current HTS tariff rates directly from USITC (no database needed).
+
+    Downloads and caches the full USITC HTS CSV in memory (refreshed at most
+    once per hour), then returns all rows matching *hts_prefix*.
+
+    Args:
+        hts_prefix: Normalised (digits-only) prefix string, e.g. ``"6111"``.
+
+    Returns:
+        List of dicts with canonical column names, or ``[]`` on failure.
+    """
+    df = _get_cached_full_df()
+    if df is None or df.empty:
+        return []
+
+    mask = df["_hts_norm"].str.startswith(hts_prefix, na=False)
+    matched = df.loc[mask, OUTPUT_COLUMNS].copy()
+    matched = matched.where(matched.notna(), None)
+    return matched.to_dict(orient="records")

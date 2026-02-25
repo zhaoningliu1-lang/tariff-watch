@@ -2,17 +2,19 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# System deps for psycopg2
+# System deps for psycopg2 and cron
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpq-dev gcc \
+    libpq-dev gcc cron \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies first (layer cache)
+# Copy source and dependencies manifest
 COPY pyproject.toml .
+COPY src/ src/
+
+# Install Python dependencies
 RUN pip install --no-cache-dir -e ".[full]"
 
-# Copy source
-COPY src/ src/
+# Copy other assets
 COPY config.example.yaml .
 COPY sample_data/ sample_data/
 

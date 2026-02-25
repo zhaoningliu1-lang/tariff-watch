@@ -10,10 +10,12 @@ tracked_hts:
   - "9403200010"
 
 sources:
-  # Obtain the direct CSV/JSON export URL from:
-  # https://hts.usitc.gov/  ->  "Export/Download" or the Open Data portal.
-  # See README.md for step-by-step instructions.
-  usitc_hts_export_url: "https://PLACEHOLDER.example.com/hts_export.csv"
+  # Tariff Watch automatically discovers the latest USITC HTS CSV URL by
+  # calling https://hts.usitc.gov/reststop/releaseList — no manual URL needed.
+  # This field is used ONLY as a fallback if auto-discovery fails.
+  # Leave as PLACEHOLDER or set a known revision URL, e.g.:
+  #   https://www.usitc.gov/tata/hts/hts_2026_revision_3_csv.csv
+  usitc_hts_export_url: "PLACEHOLDER"
 
 storage:
   snapshots_dir: snapshots

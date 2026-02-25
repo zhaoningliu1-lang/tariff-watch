@@ -19,6 +19,7 @@ from .db import (
     query_recent_notices,
 )
 from .normalize import normalize_hts_code
+from .sources_usitc import fetch_live_rates
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,8 @@ def get_tariff(hts_code: str) -> list[dict[str, Any]]:
 
     - Dots and spaces are stripped automatically.
     - A 6/8-digit code acts as a prefix and returns all matching rows.
-    - The most recent snapshot is used.
+    - The most recent database snapshot is used; if the database has not yet
+      been populated by the weekly scheduler, data is fetched live from USITC.
 
     **Example:** `/tariff/0101.21.0010` or `/tariff/6111`
     """
@@ -80,10 +82,53 @@ def get_tariff(hts_code: str) -> list[dict[str, Any]]:
         raise HTTPException(status_code=422, detail=f"Invalid HTS code: {hts_code!r}")
 
     rows = query_current_rates(prefix)
+    if rows:
+        return rows
+
+    # DB is empty (scheduler has not run yet) — fall back to live USITC query.
+    logger.info("DB has no data for prefix %s — trying live USITC lookup.", prefix)
+    live_rows = fetch_live_rates(prefix)
+    if live_rows:
+        return live_rows
+
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            f"No tariff data found for HTS prefix '{prefix}'. "
+            "The database has not been populated yet and the live USITC lookup also "
+            "returned no results. Try /live/tariff/{hts_code} for a direct query."
+        ),
+    )
+
+
+# ── Live tariff lookup (always fresh from USITC) ──────────────────────────────
+
+@app.get("/live/tariff/{hts_code}", tags=["tariff"])
+def get_tariff_live(hts_code: str) -> list[dict[str, Any]]:
+    """
+    Return **live** tariff rates fetched directly from USITC (no database needed).
+
+    The full HTS CSV is downloaded from USITC and cached in memory for up to
+    1 hour. This endpoint always returns the most current published data and
+    works even before the scheduler has run for the first time.
+
+    - Dots and spaces are stripped automatically.
+    - A 4/6/8-digit prefix returns all matching rows.
+
+    **Example:** `/live/tariff/6111` or `/live/tariff/6111.20`
+    """
+    prefix = normalize_hts_code(hts_code)
+    if not prefix:
+        raise HTTPException(status_code=422, detail=f"Invalid HTS code: {hts_code!r}")
+
+    rows = fetch_live_rates(prefix)
     if not rows:
         raise HTTPException(
             status_code=404,
-            detail=f"No tariff data found for HTS prefix '{prefix}'.",
+            detail=(
+                f"No tariff data found for HTS prefix '{prefix}' in the live USITC "
+                "table. Check that the HTS code prefix is valid."
+            ),
         )
     return rows
 

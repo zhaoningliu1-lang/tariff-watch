@@ -32,8 +32,9 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    user: root
 
-  # Weekly scheduler — runs `tariff-watch run` every Monday 09:00 LA time
+  # Weekly scheduler — runs `tariff-watch run` every Monday 09:00 UTC
   scheduler:
     build: .
     restart: unless-stopped
@@ -50,11 +51,22 @@ services:
       - ./config.yaml:/app/config.yaml:ro
       - ./snapshots:/app/snapshots
       - ./reports:/app/reports
-    entrypoint: >
-      sh -c "
-        echo '0 9 * * 1 tariff-watch run --config /app/config.yaml >> /proc/1/fd/1 2>&1'
-        | crontab - && crond -f -l 2
-      "
+    user: root
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        while true; do
+          DAY=$(date '+%u')
+          HOUR=$(date '+%H')
+          MIN=$(date '+%M')
+          if [ "$$DAY" = "1" ] && [ "$$HOUR" = "09" ] && [ "$$MIN" = "00" ]; then
+            echo "[$(date)] Running tariff-watch..."
+            tariff-watch run --config /app/config.yaml
+            sleep 60
+          fi
+          sleep 30
+        done
 
 volumes:
   pgdata:

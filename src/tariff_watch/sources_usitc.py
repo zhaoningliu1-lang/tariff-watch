@@ -24,6 +24,7 @@ OUTPUT_COLUMNS = [
     "rate_general_raw",
     "rate_special_raw",
     "rate_column2_raw",
+    "additional_duties_raw",
 ]
 
 # Common column name variants found in USITC exports → mapped to canonical names.
@@ -51,6 +52,10 @@ _COLUMN_ALIASES: dict[str, str] = {
     "column_2": "rate_column2_raw",
     "col2": "rate_column2_raw",
     "rate_column2_raw": "rate_column2_raw",
+    # additional duties (Section 301 / 232 surcharges)
+    "additional_duties": "additional_duties_raw",
+    "additional_duty": "additional_duties_raw",
+    "additional_duties_raw": "additional_duties_raw",
 }
 
 

@@ -170,6 +170,44 @@ def _cmd_run(args: argparse.Namespace) -> None:
 
     print(telegram_summary)
 
+    # ── Persist to PostgreSQL (optional — skips gracefully if DB not available) ──
+    if not args.dry_run:
+        try:
+            from .db import init_pool, apply_schema, upsert_snapshots, insert_changes
+            init_pool()
+            apply_schema()
+            rows = current_df.to_dict(orient="records")
+            saved = upsert_snapshots(rows, today.isoformat())
+            logger.info("DB: upserted %d snapshot rows for %s", saved, today)
+            if changes:
+                change_rows = [
+                    {
+                        "hts_code": c.get("hts_code", ""),
+                        "description": c.get("description"),
+                        "change_type": c.get("change_type", "rate_changed"),
+                        "field_changed": c.get("field", None),
+                        "old_value": str(c.get("old_value", "")) if c.get("old_value") is not None else None,
+                        "new_value": str(c.get("new_value", "")) if c.get("new_value") is not None else None,
+                    }
+                    for c in changes
+                ]
+                insert_changes(change_rows, today.isoformat())
+                logger.info("DB: inserted %d change records", len(change_rows))
+        except Exception as db_exc:  # noqa: BLE001
+            logger.warning("DB sync skipped (PostgreSQL not available): %s", db_exc)
+
+    # ── Fetch Federal Register notices (optional) ──────────────────────────────
+    if not args.dry_run:
+        try:
+            from .sources_fedregister import fetch_notices
+            from .db import upsert_notices
+            notices = fetch_notices()
+            if notices:
+                upsert_notices(notices)
+                logger.info("Federal Register: stored %d notice(s)", len(notices))
+        except Exception as fr_exc:  # noqa: BLE001
+            logger.warning("Federal Register fetch skipped: %s", fr_exc)
+
     if cfg.notify_email.enabled and not args.dry_run:
         from datetime import datetime
         date_str = datetime.now().strftime("%Y-%m-%d")

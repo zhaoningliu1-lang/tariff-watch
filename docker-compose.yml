@@ -1,0 +1,60 @@
+services:
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: tariff_watch
+      POSTGRES_USER: tariff
+      POSTGRES_PASSWORD: tariff
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tariff -d tariff_watch"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: tariff_watch
+      PGUSER: tariff
+      PGPASSWORD: tariff
+      CORS_ORIGINS: "*"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Weekly scheduler — runs `tariff-watch run` every Monday 09:00 LA time
+  scheduler:
+    build: .
+    restart: unless-stopped
+    environment:
+      PGHOST: db
+      PGPORT: "5432"
+      PGDATABASE: tariff_watch
+      PGUSER: tariff
+      PGPASSWORD: tariff
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./snapshots:/app/snapshots
+      - ./reports:/app/reports
+    entrypoint: >
+      sh -c "
+        echo '0 9 * * 1 tariff-watch run --config /app/config.yaml >> /proc/1/fd/1 2>&1'
+        | crontab - && crond -f -l 2
+      "
+
+volumes:
+  pgdata:

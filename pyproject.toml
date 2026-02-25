@@ -15,7 +15,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = [
+db   = ["psycopg2-binary>=2.9"]
+api  = ["psycopg2-binary>=2.9", "fastapi>=0.110", "uvicorn[standard]>=0.29"]
+full = ["psycopg2-binary>=2.9", "fastapi>=0.110", "uvicorn[standard]>=0.29"]
+dev  = [
     "pytest>=7.4",
     "requests-mock>=1.11",
     "pandas-stubs>=2.0",

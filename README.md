@@ -1,10 +1,89 @@
 # Tariff Watch
 
-**US HTS Weekly Tariff Monitor** — downloads USITC HTS export data, diffs against prior snapshots, and produces Markdown/JSON reports with a Telegram-ready stdout summary.
+**US HTS Weekly Tariff Monitor** — automatically fetches the latest USITC Harmonized Tariff Schedule, diffs against the prior week's snapshot, and produces Markdown/JSON reports. Includes a REST API and PostgreSQL storage for historical tracking.
 
 ---
 
-## Quickstart
+## Features
+
+- **Auto-discovers the latest USITC HTS revision** — no manual URL needed
+- Detects tariff rate additions, removals, and changes week-over-week
+- Filters to specific HTS prefixes (e.g. children's clothing: `6111`, `6209`)
+- REST API: `/live/tariff/{code}` returns real-time rates with no database required
+- PostgreSQL storage for historical snapshots and change tracking
+- Federal Register notices fetched and stored
+- Docker one-command deployment
+- Weekly cron scheduler (Monday 09:00 UTC)
+- Optional email notification via SMTP
+
+---
+
+## Quickstart (Docker — recommended)
+
+```bash
+git clone https://github.com/zhaoningliu1-lang/tariff-watch.git
+cd tariff-watch
+docker compose up --build -d
+```
+
+Three containers start automatically:
+
+| Container | Port | Purpose |
+|-----------|------|---------|
+| `db` | 5432 | PostgreSQL — stores snapshots and change history |
+| `api` | 8000 | FastAPI — REST endpoints for tariff queries |
+| `scheduler` | — | Runs `tariff-watch run` every Monday 09:00 UTC |
+
+Open **http://localhost:8000/docs** in your browser to see the interactive API.
+
+---
+
+## REST API
+
+### Live tariff lookup (no database needed)
+
+```
+GET /live/tariff/{hts_code}
+```
+
+Always fetches directly from USITC. Works immediately on first startup.
+Data is cached in memory for 1 hour.
+
+```bash
+curl http://localhost:8000/live/tariff/6111
+curl http://localhost:8000/live/tariff/6111.20
+```
+
+### Database-backed endpoints
+
+```
+GET /tariff/{hts_code}          Current rates from DB (falls back to live)
+GET /changes?since=YYYY-MM-DD   Rate change history
+GET /notices                    Federal Register tariff notices
+GET /health                     Service health check
+```
+
+### Example response: `/live/tariff/6111`
+
+```json
+[
+  {
+    "hts_code": "6111201000",
+    "description": "Blouses and shirts, except those imported as parts of sets",
+    "rate_general_raw": "19.7%",
+    "rate_special_raw": null,
+    "rate_column2_raw": null,
+    "additional_duties_raw": null
+  },
+  ...
+]
+```
+
+Dots and spaces in HTS codes are stripped automatically. A 4- or 6-digit prefix returns all matching rows.
+
+---
+
+## Local Development (without Docker)
 
 ### 1. Create virtual environment & install
 
@@ -19,16 +98,15 @@ pip install -e ".[dev]"
 
 ```bash
 cp config.example.yaml config.yaml
-# Edit config.yaml — at minimum set sources.usitc_hts_export_url
+# No manual URL needed — Tariff Watch auto-discovers the latest USITC CSV.
+# Edit tracked_hts to the HTS prefixes you want to monitor.
 ```
 
-### 3. Run (dry-run — no secrets needed)
+### 3. Run (dry-run — no network or secrets needed)
 
 ```bash
 python -m tariff_watch run --config config.yaml --dry-run
 ```
-
-Dry-run loads `sample_data/hts_small_current.csv` and `sample_data/hts_small_prev.csv` instead of fetching from the network. Reports are written to `reports/`.
 
 ### 4. Run tests
 
@@ -38,100 +116,88 @@ pytest
 
 ---
 
-## Obtaining the USITC HTS Export URL
+## CLI Reference
 
-Tariff Watch does **not** hardcode any USITC URL because export URLs change over time.
+### `run` — fetch, diff, report, store
 
-**Steps to get a valid CSV export link:**
+```bash
+tariff-watch run [OPTIONS]
 
-1. Go to **https://hts.usitc.gov/**
-2. Look for an **"Export"**, **"Download"**, or **"Open Data"** button/link, typically in the page header or footer.
-3. Choose **CSV** format and start the download. Copy the direct download URL from your browser (check the network tab or the link href).
-4. Paste it into `config.yaml` under `sources.usitc_hts_export_url`.
+Options:
+  --config PATH                   Config file (default: config.yaml)
+  --dry-run                       Use sample data; skip network and email
+  --mode tracked_only|full_table  Override config mode
+  --tracked-hts-file PATH         File with one HTS code per line
+```
 
-> The USITC also publishes structured data via **https://www.usitc.gov/tata/hts/** and there may be an API at **https://hts.usitc.gov/api**. Check the site for current export options.
+Results are automatically saved to PostgreSQL if the database is reachable.
+If PostgreSQL is unavailable, the run completes normally and only CSV snapshots are saved.
 
-> **Performance note:** Full-table mode downloads and processes the entire HTS schedule (~10,000+ rows). Set `mode: tracked_only` with a focused `tracked_hts` list for faster, cheaper runs.
+### `lookup` — query current tariff rates
 
-> **HTS code format:** Supply **10-digit** numeric codes (e.g. `8471300000`). The normaliser strips dots and spaces but does not zero-pad codes of unexpected length.
+```bash
+tariff-watch lookup --hts CODE [OPTIONS]
+
+Options:
+  --hts CODE     HTS code or prefix (dots optional). Comma-separate multiple:
+                 --hts 6111,6209
+  --config PATH  Config file (default: config.yaml)
+  --json         Output JSON only
+
+Examples:
+  tariff-watch lookup --hts 6111.20.6010
+  tariff-watch lookup --hts 6111,6209
+  tariff-watch lookup --hts 6111 --json
+```
 
 ---
 
-## Email Configuration
+## Configuration (`config.yaml`)
 
-Set `notify_email.enabled: true` in `config.yaml` and export these environment variables before running:
+```yaml
+mode: tracked_only          # tracked_only | full_table
 
-```bash
-export SMTP_HOST="smtp.example.com"
-export SMTP_USER="you@example.com"
-export SMTP_PASS="yourpassword"
-export FROM_EMAIL="tariffwatch@example.com"
+tracked_hts:
+  - "6111"                  # Babies' garments, knitted
+  - "6209"                  # Babies' garments, woven
+  - "6103"                  # Boys' suits, knitted
+  - "6104"                  # Girls' suits, knitted
+
+sources:
+  # Leave as PLACEHOLDER — auto-discovery finds the latest USITC revision.
+  usitc_hts_export_url: "PLACEHOLDER"
+
+storage:
+  snapshots_dir: snapshots
+  reports_dir: reports
+  retain_weeks: 12
+
+notify_email:
+  enabled: false
+  smtp_host: "ENV:SMTP_HOST"
+  smtp_port: 587
+  smtp_user: "ENV:SMTP_USER"
+  smtp_password: "ENV:SMTP_PASS"
+  from_email: "ENV:FROM_EMAIL"
+  to_emails:
+    - "you@example.com"
 ```
-
-Email uses **STARTTLS on port 587**. HTML rendering wraps the Markdown in `<pre>` for broad compatibility. To get richer HTML, install the `markdown` package and update `email_notify._markdown_to_html()`.
-
-Email failures are logged as warnings and **do not affect the exit code** (exit 0 is still returned, but `[WARNING] email failed` is printed to stdout).
 
 ---
 
 ## Output Files
 
 | Path | Description |
-|---|---|
-| `snapshots/hts_snapshot_YYYYMMDD.csv` | Raw normalised snapshot (retained for `retain_weeks * 2` runs) |
-| `reports/report_YYYYMMDD.md` | Markdown weekly report |
+|------|-------------|
+| `snapshots/hts_snapshot_YYYYMMDD.csv` | Normalised HTS snapshot |
+| `reports/report_YYYYMMDD.md` | Full Markdown weekly report |
 | `reports/report_YYYYMMDD.json` | Structured JSON report |
 
 ---
 
-## CLI Reference
+## OpenClaw / Telegram Integration
 
-### `run` — fetch, diff, report
-
-```bash
-python -m tariff_watch run [OPTIONS]
-# or, after pip install -e .:
-tariff-watch run [OPTIONS]
-
-Options:
-  --config PATH                   Config file path (default: config.yaml)
-  --dry-run                       Use sample data; skip network and email
-  --mode tracked_only|full_table  Override config mode
-  --tracked-hts-file PATH         File with one HTS code per line
-```
-
-### `lookup` — query current tariff rates for any HTS code
-
-```bash
-python -m tariff_watch lookup --hts CODE [OPTIONS]
-
-Options:
-  --hts CODE       HTS code to look up. Dots optional, 6/8/10-digit prefix
-                   supported. Comma-separate multiple codes:
-                   --hts 0101210010,0102290000
-  --config PATH    Config file path (default: config.yaml)
-  --json           Output machine-readable JSON only (suppresses table)
-
-Examples:
-  tariff-watch lookup --hts 6111.20.6010
-  tariff-watch lookup --hts 6111,6209
-  tariff-watch lookup --hts 8471.30.0100 --json
-```
-
-**Exit codes:**
-
-| Code | Meaning |
-|---|---|
-| 0 | Success |
-| 2 | Configuration error |
-| 3 | Network / data error |
-| 4 | Runtime exception |
-
----
-
-## OpenClaw Cron Integration (Telegram channel)
-
-Tariff Watch does **not** implement a Telegram Bot internally. Telegram delivery is handled by **OpenClaw Gateway's `--announce` flag**, which captures stdout and posts it to your connected Telegram channel.
+Tariff Watch prints a Telegram-ready summary to stdout on each run. Use OpenClaw Gateway to post it automatically:
 
 ```bash
 openclaw cron add \
@@ -139,10 +205,28 @@ openclaw cron add \
   --cron "0 9 * * 1" \
   --tz "America/Los_Angeles" \
   --session isolated \
-  --message "Run Tariff Watch skill in repo: execute \`python -m tariff_watch run --config config.yaml\` and announce stdout summary." \
+  --message "Run Tariff Watch: execute python -m tariff_watch run --config config.yaml and announce stdout summary." \
   --announce \
   --channel telegram \
-  --to "chat:<TELEGRAM_CHAT_ID_OR_TARGET>"
+  --to "chat:<TELEGRAM_CHAT_ID>"
 ```
 
-Replace `<TELEGRAM_CHAT_ID_OR_TARGET>` with your OpenClaw Telegram target (channel ID, username, etc.). The skill only prints the summary to stdout — OpenClaw handles the rest.
+---
+
+## Deploying to Railway (public API)
+
+To make the API accessible from the internet:
+
+1. Go to **https://railway.app** and create a free account
+2. Click **New Project → Deploy from GitHub repo**
+3. Select `zhaoningliu1-lang/tariff-watch`
+4. Railway auto-detects the `Dockerfile` and deploys the API
+5. Add a **PostgreSQL** plugin in the Railway dashboard
+6. Set environment variables: `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD` (Railway provides these automatically with the plugin)
+7. Your API is live at `https://your-app.railway.app/live/tariff/6111`
+
+---
+
+## Disclaimer
+
+For informational purposes only. Always verify tariff obligations with CBP binding rulings, a licensed customs broker, or trade counsel.

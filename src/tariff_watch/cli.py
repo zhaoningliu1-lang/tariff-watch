@@ -173,10 +173,17 @@ def _cmd_run(args: argparse.Namespace) -> None:
     # ── Persist to PostgreSQL (optional — skips gracefully if DB not available) ──
     if not args.dry_run:
         try:
+            import math as _math
             from .db import init_pool, apply_schema, upsert_snapshots, insert_changes
             init_pool()
             apply_schema()
-            rows = current_df.to_dict(orient="records")
+            # Replace float NaN with None so psycopg2 stores SQL NULL correctly
+            raw_rows = current_df.to_dict(orient="records")
+            rows = [
+                {k: None if (isinstance(v, float) and _math.isnan(v)) else v
+                 for k, v in r.items()}
+                for r in raw_rows
+            ]
             saved = upsert_snapshots(rows, today.isoformat())
             logger.info("DB: upserted %d snapshot rows for %s", saved, today)
             if changes:

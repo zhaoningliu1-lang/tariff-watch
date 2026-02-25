@@ -1,10 +1,43 @@
+````skill
 # SKILL: Tariff Watch
 
-> ClawHub Skill · v0.1.0 · Python 3.11+
+> ClawHub Skill · v2.0.0 · Python 3.11+
 
 ## Overview
 
-Tariff Watch monitors the US Harmonized Tariff Schedule (HTS) published by the USITC. Each run downloads the configured HTS export, compares it to the previous snapshot, and produces structured reports. A Telegram-ready summary is printed to stdout for OpenClaw Gateway to forward to channels.
+Tariff Watch monitors the US Harmonized Tariff Schedule (HTS) published by the USITC.
+
+**Key capability:** Answer questions about US import tariff rates by HTS code or product category. The skill automatically fetches the latest published rates directly from USITC — no manual URL configuration needed.
+
+**Live data source:** `https://hts.usitc.gov/reststop/releaseList` — always points to the current HTS revision (e.g. 2026 Revision 3, containing 29,000+ rows).
+
+---
+
+## How to Query Tariff Rates (OpenClaw Usage)
+
+To answer a user question like *"What is the tariff rate for children's cotton clothing from China?"*:
+
+1. Identify the HTS chapter/prefix (e.g. `6111` = babies' knitted garments, `6209` = babies' woven garments)
+2. Fetch live rates from USITC:
+
+```python
+from tariff_watch.sources_usitc import fetch_live_rates
+rows = fetch_live_rates("6111")   # returns list of dicts
+# Each dict has: hts_code, description, rate_general_raw, additional_duties_raw
+```
+
+3. Report `rate_general_raw` (MFN base rate) and `additional_duties_raw` (Section 301 surcharge if any).
+
+### Common HTS Prefixes for Children's Clothing
+
+| HTS Prefix | Description |
+|---|---|
+| `6111` | Babies' garments, knitted or crocheted |
+| `6209` | Babies' garments, not knitted |
+| `6103` | Boys' suits/jackets/trousers, knitted |
+| `6104` | Girls' suits/dresses, knitted |
+| `6203` | Men's/boys' suits/trousers, woven |
+| `6204` | Women's/girls' suits/dresses, woven |
 
 ---
 
@@ -12,12 +45,10 @@ Tariff Watch monitors the US Harmonized Tariff Schedule (HTS) published by the U
 
 | Parameter | Where to set | Description |
 |---|---|---|
-| `tracked_hts` | `config.yaml` | List of 10-digit HTS codes to watch (`mode: tracked_only`) |
-| `mode` | `config.yaml` or `--mode` flag | `tracked_only` (default) or `full_table` |
-| `sources.usitc_hts_export_url` | `config.yaml` | Direct URL to USITC HTS CSV export (see README for how to obtain) |
+| `tracked_hts` | `config.yaml` | HTS prefixes to monitor weekly (e.g. `6111`, `6209`) |
+| `mode` | `config.yaml` | `tracked_only` (default) or `full_table` |
+| `sources.usitc_hts_export_url` | `config.yaml` | Fallback URL only — auto-discovery handles this automatically |
 | SMTP credentials | Environment variables | `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, `FROM_EMAIL` |
-| `notify_email.enabled` | `config.yaml` | `true` to send email report |
-| `notify_email.to_emails` | `config.yaml` | List of recipient email addresses |
 
 ---
 
@@ -25,22 +56,27 @@ Tariff Watch monitors the US Harmonized Tariff Schedule (HTS) published by the U
 
 | Output | Description |
 |---|---|
-| **stdout** | Telegram-ready text summary (≤20 lines): date, top 3 changes, report paths |
+| **stdout** | Telegram-ready summary (<=20 lines): date, top changes |
 | `reports/report_YYYYMMDD.md` | Full Markdown weekly report |
 | `reports/report_YYYYMMDD.json` | Structured JSON: meta + changes list |
 | `snapshots/hts_snapshot_YYYYMMDD.csv` | Normalised HTS snapshot |
-| Email (optional) | Markdown report as plain-text + HTML email via SMTP |
+| REST API | `/live/tariff/{hts_code}` for real-time queries |
 
 ---
 
-## How Telegram Delivery Works
+## REST API Endpoints (when deployed)
 
-This skill does **not** run a Telegram Bot. Instead:
+| Endpoint | Description |
+|---|---|
+| `GET /live/tariff/{code}` | Live rates from USITC, no DB needed |
+| `GET /tariff/{code}` | Rates from DB (falls back to live) |
+| `GET /changes?since=YYYY-MM-DD` | Rate change history |
+| `GET /notices` | Federal Register tariff notices |
+| `GET /health` | Service health check |
 
-1. The skill prints a concise summary to **stdout**.
-2. **OpenClaw Gateway** captures stdout and posts it to your Telegram channel via the `--announce` flag.
+---
 
-Recommended cron command:
+## Weekly Cron (OpenClaw Gateway)
 
 ```bash
 openclaw cron add \
@@ -48,42 +84,15 @@ openclaw cron add \
   --cron "0 9 * * 1" \
   --tz "America/Los_Angeles" \
   --session isolated \
-  --message "Run Tariff Watch skill in repo: execute \`python -m tariff_watch run --config config.yaml\` and announce stdout summary." \
+  --message "Run Tariff Watch: execute python -m tariff_watch run --config config.yaml and announce stdout summary." \
   --announce \
   --channel telegram \
-  --to "chat:<TELEGRAM_CHAT_ID_OR_TARGET>"
+  --to "chat:<TELEGRAM_CHAT_ID>"
 ```
 
 ---
 
-## Limitations & Disclaimer (V1 Scope)
+## Disclaimer
 
-- **Data source:** Relies on the user-supplied USITC HTS CSV export URL. If USITC changes its export format, column mapping may need updating.
-- **Not included in V1:**
-  - Section 301 (China) additional tariffs
-  - Section 232 (Steel/Aluminium) additional tariffs
-  - AD/CVD (Anti-Dumping / Countervailing Duty) orders
-  - Complex GSP/FTA special rate parsing
-  - HTS classification disputes
-  - CBP binding rulings
-- **For informational purposes only.** Always verify tariff obligations with CBP binding rulings, a licensed customs broker, or trade counsel.
-
----
-
-## Planned Extensions (Future Versions)
-
-- **V2:** Federal Register monitoring for Section 301/232 USTR notices.
-- **V2:** AD/CVD lookup via CBP ADCVD database.
-- **V3:** FTA special rate structured parsing (USMCA, KORUS, etc.).
-- **V3:** Multi-source reconciliation (USITC + CBP ACE).
-- **V4:** Web dashboard / API endpoint for real-time queries.
-
----
-
-## Running Dry-Run (No Secrets Required)
-
-```bash
-python -m tariff_watch run --config config.yaml --dry-run
-```
-
-Uses bundled sample data. Safe to run in CI and for initial setup verification.
+For informational purposes only. Always verify tariff obligations with CBP binding rulings, a licensed customs broker, or trade counsel. Section 301 / Section 232 additional duties change frequently — confirm with the Federal Register.
+````

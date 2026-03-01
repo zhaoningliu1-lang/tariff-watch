@@ -32,6 +32,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .antidumping import lookup_adcvd
+from .trade_compliance import get_compliance_flags
+
 
 # ── Section 232 ───────────────────────────────────────────────────────────────
 
@@ -92,6 +95,10 @@ class TariffOverlay:
     base_rate_pct: float
     section_232_pct: float = 0.0
     section_301_pct: float = 0.0
+    adcvd_estimated_pct: float = 0.0
+    adcvd_risk_level: str = "none"
+    adcvd_orders_count: int = 0
+    compliance_flags: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     advisory: list[str] = field(default_factory=list)
 
@@ -103,8 +110,13 @@ class TariffOverlay:
     def effective_total_pct(self) -> float:
         return self.base_rate_pct + self.total_additional_pct
 
+    @property
+    def worst_case_total_pct(self) -> float:
+        """Effective total including AD/CVD (worst-case scenario)."""
+        return self.effective_total_pct + self.adcvd_estimated_pct
+
     def as_dict(self) -> dict:
-        return {
+        result = {
             "origin": self.origin,
             "origin_display": _display(self.origin),
             "hts_code": self.hts_code,
@@ -116,6 +128,23 @@ class TariffOverlay:
             "notes": self.notes,
             "advisory": self.advisory,
         }
+        # AD/CVD section (only if there are matching orders)
+        if self.adcvd_orders_count > 0:
+            result["adcvd"] = {
+                "estimated_additional_pct": round(self.adcvd_estimated_pct, 2),
+                "risk_level": self.adcvd_risk_level,
+                "matching_orders_count": self.adcvd_orders_count,
+                "worst_case_total_pct": round(self.worst_case_total_pct, 2),
+                "warning": (
+                    f"AD/CVD duties could add +{self.adcvd_estimated_pct:.1f}% "
+                    f"on top of all other duties (worst case: {self.worst_case_total_pct:.1f}%). "
+                    f"Actual rate is company-specific — consult a trade attorney."
+                ),
+            }
+        # Compliance flags
+        if self.compliance_flags:
+            result["compliance_flags"] = self.compliance_flags
+        return result
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -197,6 +226,25 @@ def compute_overlay(
     if not overlay.notes:
         overlay.notes.append(
             f"No additional Section 232 or 301 duties for origin: {_display(origin)}"
+        )
+
+    # ── AD/CVD lookup ────────────────────────────────────────────────────────
+    adcvd = lookup_adcvd(hts_code, origin)
+    if adcvd.matching_orders:
+        overlay.adcvd_estimated_pct = adcvd.estimated_additional_pct
+        overlay.adcvd_risk_level = adcvd.risk_level
+        overlay.adcvd_orders_count = len(adcvd.matching_orders)
+        overlay.notes.append(
+            f"⚠ AD/CVD: {len(adcvd.matching_orders)} active order(s) — "
+            f"'all others' rate up to +{adcvd.estimated_additional_pct:.1f}%. "
+            f"Company-specific rate may differ."
+        )
+
+    # ── Compliance flags ─────────────────────────────────────────────────────
+    overlay.compliance_flags = get_compliance_flags(hts_code)
+    if overlay.compliance_flags:
+        overlay.notes.append(
+            f"Regulatory agencies: {', '.join(overlay.compliance_flags)}"
         )
 
     # ── Section 122 advisory (all origins) ───────────────────────────────────

@@ -1,4 +1,4 @@
-"""FastAPI Web API for Tariff Watch V2."""
+"""FastAPI Web API for Tariff Watch V3."""
 
 from __future__ import annotations
 
@@ -18,19 +18,21 @@ from .db import (
     query_recent_changes,
     query_recent_notices,
 )
+from .antidumping import get_all_orders, get_orders_by_chapter, lookup_adcvd
 from .normalize import normalize_hts_code, parse_rate
 from .sources_usitc import fetch_live_rates
 from .tariff_overlay import compute_overlay
+from .trade_compliance import get_compliance_report, get_entry_requirements
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Tariff Watch API",
     description=(
-        "Query current US HTS tariff rates, rate change history, "
-        "and Federal Register tariff notices."
+        "Query current US HTS tariff rates, AD/CVD duties, trade compliance, "
+        "rate change history, and Federal Register tariff notices."
     ),
-    version="2.0.0",
+    version="3.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -64,7 +66,7 @@ def shutdown() -> None:
 @app.get("/health", tags=["meta"])
 def health() -> dict[str, str]:
     """Returns 200 OK when the API and database are reachable."""
-    return {"status": "ok", "version": "2.0.0"}
+    return {"status": "ok", "version": "3.0.0"}
 
 
 # ── Tariff lookup ─────────────────────────────────────────────────────────────
@@ -280,6 +282,81 @@ def get_notices(
         return []
 
 
+# ── AD/CVD (Anti-Dumping / Countervailing Duties) ────────────────────────────
+
+@app.get("/adcvd/{hts_code}", tags=["adcvd"])
+def get_adcvd(
+    hts_code: str,
+    origin: str = Query(default="CN", description="Country of origin (ISO-2/ISO-3)"),
+) -> dict:
+    """
+    Check if an HTS code falls under any active AD/CVD orders.
+
+    Returns matching orders with estimated additional duty rates.
+    AD/CVD rates are company-specific — the 'all others' rate is shown as a worst case.
+
+    **Example:** `/adcvd/7604101000?origin=CN`
+    """
+    code = normalize_hts_code(hts_code)
+    if not code:
+        raise HTTPException(status_code=422, detail=f"Invalid HTS code: {hts_code!r}")
+    exposure = lookup_adcvd(code, origin=origin)
+    return exposure.as_dict()
+
+
+@app.get("/adcvd/orders", tags=["adcvd"])
+def get_adcvd_orders(
+    origin: str = Query(default="CN", description="Country of origin"),
+    chapter: str | None = Query(default=None, description="Filter by HTS chapter (e.g. '76')"),
+) -> list[dict]:
+    """
+    Return all active AD/CVD orders for a country, optionally filtered by HTS chapter.
+
+    **Example:** `/adcvd/orders?origin=CN&chapter=76`
+    """
+    if chapter:
+        orders = get_orders_by_chapter(chapter, origin=origin)
+    else:
+        orders = get_all_orders(origin=origin)
+    return [o.as_dict() for o in orders]
+
+
+# ── Trade Compliance ─────────────────────────────────────────────────────────
+
+@app.get("/compliance/{hts_code}", tags=["compliance"])
+def get_compliance(
+    hts_code: str,
+    origin: str = Query(default="CN", description="Country of origin (ISO-2/ISO-3)"),
+) -> dict:
+    """
+    Generate a full compliance report for a product: regulatory requirements,
+    UFLPA risk, and marking rules.
+
+    **Example:** `/compliance/9503000013?origin=CN`
+    """
+    code = normalize_hts_code(hts_code)
+    if not code:
+        raise HTTPException(status_code=422, detail=f"Invalid HTS code: {hts_code!r}")
+    report = get_compliance_report(code, origin=origin)
+    return report.as_dict()
+
+
+@app.get("/compliance/entry-costs", tags=["compliance"])
+def get_entry_costs(
+    origin: str = Query(default="CN", description="Country of origin"),
+    estimated_value_usd: float = Query(
+        default=5000.0, ge=0, description="Estimated shipment value in USD"
+    ),
+) -> dict:
+    """
+    Calculate customs entry costs: broker fee, ISF filing, bond, MPF, HMF, exam risk.
+
+    **Example:** `/compliance/entry-costs?origin=CN&estimated_value_usd=10000`
+    """
+    entry = get_entry_requirements(origin=origin, estimated_value_usd=estimated_value_usd)
+    return entry.as_dict()
+
+
 # ── Amazon Product Analytics ──────────────────────────────────────────────────
 
 from .sources_amazon import (  # noqa: E402
@@ -317,12 +394,18 @@ def amazon_profit(
         default="CN",
         description="Country of origin — ISO-2 or ISO-3 code, e.g. 'CN', 'VN', 'MX', 'IN'",
     ),
+    include_adcvd: bool = Query(
+        default=False,
+        description="Include AD/CVD worst-case rate in tariff calculation",
+    ),
 ) -> dict[str, Any]:
     """
     Calculate profit breakdown for a product with full tariff stack by origin country.
 
-    Tariff = MFN base rate (live USITC) + Section 232 + Section 301 + 2025 exec. order.
-    Pass `?origin=VN` for Vietnam, `?origin=MX` for Mexico, etc.  Default: China (CN).
+    Tariff = MFN base + Section 232 + Section 301.  Customs costs (broker, ISF, bond)
+    are amortized per unit.  Pass `include_adcvd=true` to include worst-case AD/CVD rate.
+
+    **Example:** `/amazon/profit/B08Y8NXGKJ?origin=CN&include_adcvd=true`
     """
     p = get_product(asin.upper())
     if not p:
@@ -331,13 +414,19 @@ def amazon_profit(
     hts: str | None = normalize_hts_code(p["hts_code"])
     base_pct, source = _lookup_base_rate(hts) if hts else (0.0, "no_hts")
     overlay = compute_overlay(hts_code=hts or "", origin=origin, base_rate_pct=base_pct)
-    tariff_rate = overlay.effective_total_pct / 100.0
 
-    result = calculate_profit(asin.upper(), tariff_rate=tariff_rate)
+    effective_pct = overlay.effective_total_pct
+    if include_adcvd:
+        effective_pct = overlay.worst_case_total_pct
+    tariff_rate = effective_pct / 100.0
+
+    result = calculate_profit(asin.upper(), tariff_rate=tariff_rate, include_customs=True)
     if result:
         result["tariff_source"] = source
         result["tariff_breakdown"] = overlay.as_dict()
-        result["breakdown"]["tariff_rate_pct"] = round(overlay.effective_total_pct, 2)
+        result["breakdown"]["tariff_rate_pct"] = round(effective_pct, 2)
+        if include_adcvd and overlay.adcvd_orders_count > 0:
+            result["breakdown"]["includes_adcvd"] = True
     return result or {}
 
 

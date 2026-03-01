@@ -136,7 +136,20 @@ def get_product(asin: str) -> dict[str, Any] | None:
     return _PRODUCTS.get(asin)
 
 
-def calculate_profit(asin: str, tariff_rate: float = 0.0) -> dict[str, Any] | None:
+_CUSTOMS_BROKER_FEE = 150.0   # per entry
+_CUSTOMS_ISF_FEE = 35.0       # ISF 10+2 filing
+_CUSTOMS_BOND_FEE = 12.0      # single-entry bond
+_CUSTOMS_EXAM_PROB = 0.03     # 3% chance of exam
+_CUSTOMS_EXAM_COST = 500.0    # average exam cost
+_DEFAULT_UNITS_PER_SHIPMENT = 100
+
+
+def calculate_profit(
+    asin: str,
+    tariff_rate: float = 0.0,
+    include_customs: bool = True,
+    units_per_shipment: int = _DEFAULT_UNITS_PER_SHIPMENT,
+) -> dict[str, Any] | None:
     p = _PRODUCTS.get(asin)
     if not p:
         return None
@@ -146,21 +159,47 @@ def calculate_profit(asin: str, tariff_rate: float = 0.0) -> dict[str, Any] | No
     referral = estimate_referral_fee(price, p["category"])
     shipping = estimate_shipping_cost(p["weight_lbs"])
     tariff_amount = round(cog * tariff_rate, 2)
-    total_cost = round(cog + fba + referral + shipping + tariff_amount, 2)
+
+    # Customs costs amortized per unit
+    customs_per_unit = 0.0
+    customs_detail = None
+    if include_customs:
+        total_customs = (
+            _CUSTOMS_BROKER_FEE
+            + _CUSTOMS_ISF_FEE
+            + _CUSTOMS_BOND_FEE
+            + _CUSTOMS_EXAM_PROB * _CUSTOMS_EXAM_COST
+        )
+        units = max(1, units_per_shipment)
+        customs_per_unit = round(total_customs / units, 2)
+        customs_detail = {
+            "broker_fee_per_unit": round(_CUSTOMS_BROKER_FEE / units, 2),
+            "isf_fee_per_unit": round(_CUSTOMS_ISF_FEE / units, 2),
+            "bond_fee_per_unit": round(_CUSTOMS_BOND_FEE / units, 2),
+            "exam_risk_per_unit": round((_CUSTOMS_EXAM_PROB * _CUSTOMS_EXAM_COST) / units, 2),
+            "total_per_unit": customs_per_unit,
+            "units_in_shipment": units,
+        }
+
+    total_cost = round(cog + fba + referral + shipping + tariff_amount + customs_per_unit, 2)
     net_profit = round(price - total_cost, 2)
+    breakdown = {
+        "cost_of_goods": cog,
+        "shipping_china_us": shipping,
+        "tariff": tariff_amount,
+        "tariff_rate_pct": round(tariff_rate * 100, 2),
+        "hts_code": p["hts_code"],
+        "fba_fee": fba,
+        "amazon_referral_fee": referral,
+    }
+    if customs_detail:
+        breakdown["customs_costs"] = customs_detail
+        breakdown["customs_per_unit"] = customs_per_unit
     return {
         "asin": asin,
         "title": p["title"],
         "price": price,
-        "breakdown": {
-            "cost_of_goods": cog,
-            "shipping_china_us": shipping,
-            "tariff": tariff_amount,
-            "tariff_rate_pct": round(tariff_rate * 100, 2),
-            "hts_code": p["hts_code"],
-            "fba_fee": fba,
-            "amazon_referral_fee": referral,
-        },
+        "breakdown": breakdown,
         "total_cost": total_cost,
         "net_profit": net_profit,
         "margin_pct": round(net_profit / price * 100, 1) if price > 0 else 0.0,

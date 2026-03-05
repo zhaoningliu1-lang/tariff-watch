@@ -4,9 +4,11 @@ Exchange rate monitoring — tracks USD vs. major trade-partner currencies.
 Provides current spot rates, 30-day history with trend analysis, and
 landed-cost impact calculation for cross-border sellers.
 
-Data is currently mock (realistic ranges based on Feb 2026 market levels).
-Replace with a live API (e.g. ECB, Open Exchange Rates, Frankfurter) for
-production use.
+Data sources (in priority order):
+  1. SQLite cache (populated by scheduler from live APIs)
+  2. ECB via frankfurter.app (free, no key, 14/18 currencies)
+  3. exchangerate-api.com (optional, requires EXCHANGERATE_API_KEY, all 18 currencies)
+  4. Calibrated simulation fallback for ECB-gap currencies (VND, BDT, PKR, TWD)
 
 Usage::
 
@@ -20,13 +22,23 @@ Usage::
 
 from __future__ import annotations
 
+import logging
+import os
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Any
 
+import requests
 
-_TODAY = date(2026, 3, 4)
+logger = logging.getLogger(__name__)
+
+# ── Configuration ────────────────────────────────────────────────────────────
+
+_PREMIUM_API_KEY: str | None = os.environ.get("EXCHANGERATE_API_KEY")
+
+# Currencies NOT covered by ECB/frankfurter — need premium or simulation
+_ECB_GAP_CURRENCIES = {"VND", "BDT", "PKR", "TWD"}
 
 # ── Currency metadata ────────────────────────────────────────────────────────
 
@@ -39,7 +51,7 @@ class CurrencyInfo:
     country_zh: str
     symbol: str
     base_rate: float    # baseline USD/X rate (how many X per 1 USD)
-    volatility: float   # daily volatility factor for mock data
+    volatility: float   # daily volatility factor for simulation fallback
 
 _CURRENCIES: dict[str, CurrencyInfo] = {
     "CNY": CurrencyInfo("CNY", "Chinese Yuan", "人民币", "China", "中国", "¥", 7.35, 0.003),
@@ -79,7 +91,7 @@ _COUNTRY_TO_CURRENCY: dict[str, str] = {
     "PK": "PKR",
     "TW": "TWD",
     "MX": "MXN", "MEX": "MXN",
-    "CA": "CAN", "CAN": "CAD",
+    "CA": "CAD", "CAN": "CAD",
     "BR": "BRL",
     "TR": "TRY",
 }
@@ -93,28 +105,202 @@ def _currency_for_origin(origin: str) -> str | None:
     return _COUNTRY_TO_CURRENCY.get(key)
 
 
-# ── Mock rate generation ─────────────────────────────────────────────────────
+# ── Live data fetching ───────────────────────────────────────────────────────
+
+def _fetch_ecb_latest() -> dict[str, float]:
+    """Fetch latest rates from ECB via frankfurter.app (free, no key)."""
+    try:
+        resp = requests.get(
+            "https://api.frankfurter.app/latest",
+            params={"from": "USD"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("rates", {})
+    except Exception as e:
+        logger.warning("ECB fetch failed: %s", e)
+        return {}
+
+
+def _fetch_ecb_timeseries(days: int = 30) -> dict[str, dict[str, float]]:
+    """Fetch date-range time series from ECB.
+
+    Returns {date_str: {currency: rate, ...}, ...}.
+    """
+    end = date.today()
+    start = end - timedelta(days=days)
+    try:
+        resp = requests.get(
+            f"https://api.frankfurter.app/{start.isoformat()}..{end.isoformat()}",
+            params={"from": "USD"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("rates", {})
+    except Exception as e:
+        logger.warning("ECB time series fetch failed: %s", e)
+        return {}
+
+
+def _fetch_premium_latest(api_key: str) -> dict[str, float]:
+    """Fetch latest rates from exchangerate-api.com (covers all 18 currencies)."""
+    try:
+        resp = requests.get(
+            f"https://v6.exchangerate-api.com/v6/{api_key}/latest/USD",
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("result") != "success":
+            logger.warning("Premium FX API error: %s", data.get("error-type"))
+            return {}
+        return data.get("conversion_rates", {})
+    except Exception as e:
+        logger.warning("Premium FX API fetch failed: %s", e)
+        return {}
+
+
+# ── Refresh functions (called by scheduler) ──────────────────────────────────
+
+def refresh_fx_rates() -> dict[str, float]:
+    """Fetch latest FX rates from live APIs and persist to SQLite.
+
+    Priority: premium API (if key set) > ECB > simulation for gap currencies.
+    Called by the background scheduler daily.
+    """
+    from . import data_store
+
+    rates: dict[str, float] = {}
+    sources: dict[str, str] = {}
+
+    # Try premium first (covers all 18)
+    if _PREMIUM_API_KEY:
+        premium = _fetch_premium_latest(_PREMIUM_API_KEY)
+        for code in _CURRENCIES:
+            if code in premium:
+                rates[code] = premium[code]
+                sources[code] = "exchangerate_api"
+
+    # Fill gaps with ECB
+    missing = [c for c in _CURRENCIES if c not in rates]
+    if missing:
+        ecb = _fetch_ecb_latest()
+        for code in missing:
+            if code in ecb:
+                rates[code] = ecb[code]
+                sources[code] = "ecb"
+
+    # Simulate remaining gap currencies
+    still_missing = [c for c in _CURRENCIES if c not in rates]
+    for code in still_missing:
+        info = _CURRENCIES[code]
+        # Try to anchor to last known rate from SQLite
+        last = data_store.query_fx_latest(code)
+        base = last["rate"] if last else info.base_rate
+        delta = random.gauss(0, info.volatility)
+        new_rate = base * (1 + delta)
+        new_rate = max(info.base_rate * 0.90, min(info.base_rate * 1.10, new_rate))
+        rates[code] = round(new_rate, 4 if new_rate < 100 else 2)
+        sources[code] = "simulated"
+
+    # Persist to SQLite
+    today_str = date.today().isoformat()
+    rows = [
+        {"currency": code, "rate": rate, "rate_date": today_str, "source": sources[code]}
+        for code, rate in rates.items()
+    ]
+    count = data_store.upsert_fx_rates_bulk(rows)
+    data_store.set_meta("fx_last_refresh", today_str)
+    logger.info("FX rates refreshed: %d currencies (%s)", count,
+                {s: sum(1 for v in sources.values() if v == s) for s in set(sources.values())})
+
+    # Clear in-memory cache so next read picks up new data
+    _HISTORY_CACHE.clear()
+    return rates
+
+
+def refresh_fx_history_backfill(days: int = 30) -> int:
+    """Backfill 30 days of ECB history into SQLite. Run once on first startup."""
+    from . import data_store
+
+    timeseries = _fetch_ecb_timeseries(days)
+    if not timeseries:
+        logger.warning("ECB backfill failed — no data returned")
+        return 0
+
+    rows = []
+    for date_str, day_rates in timeseries.items():
+        for code in _CURRENCIES:
+            if code in day_rates:
+                rows.append({
+                    "currency": code,
+                    "rate": day_rates[code],
+                    "rate_date": date_str,
+                    "source": "ecb",
+                })
+
+    # Also simulate gap currencies for the backfill period
+    for code in _ECB_GAP_CURRENCIES:
+        if code not in _CURRENCIES:
+            continue
+        info = _CURRENCIES[code]
+        random.seed(hash(code) + 99)
+        rate = info.base_rate
+        sorted_dates = sorted(timeseries.keys())
+        for d in sorted_dates:
+            delta = random.gauss(0, info.volatility)
+            rate = rate * (1 + delta)
+            rate = max(info.base_rate * 0.90, min(info.base_rate * 1.10, rate))
+            rows.append({
+                "currency": code,
+                "rate": round(rate, 4 if rate < 100 else 2),
+                "rate_date": d,
+                "source": "simulated",
+            })
+
+    count = data_store.upsert_fx_rates_bulk(rows)
+    data_store.set_meta("fx_backfilled", "true")
+    data_store.set_meta("fx_last_refresh", date.today().isoformat())
+    logger.info("FX history backfilled: %d rows over %d days", count, days)
+    return count
+
+
+# ── History cache (SQLite first, mock fallback) ──────────────────────────────
+
+_HISTORY_CACHE: dict[str, list[dict[str, Any]]] = {}
+
 
 def _gen_rate_history(info: CurrencyInfo, days: int = 30) -> list[dict[str, Any]]:
-    """Generate realistic daily FX rate history."""
-    random.seed(hash(info.code) + 42)  # deterministic per currency
+    """Generate simulated daily FX rate history (fallback only)."""
+    random.seed(hash(info.code) + 42)
     result = []
     rate = info.base_rate
+    today = date.today()
     for i in range(days, -1, -1):
         delta = random.gauss(0, info.volatility)
         rate = rate * (1 + delta)
         rate = max(info.base_rate * 0.94, min(info.base_rate * 1.06, rate))
         result.append({
-            "date": (_TODAY - timedelta(days=i)).isoformat(),
+            "date": (today - timedelta(days=i)).isoformat(),
             "rate": round(rate, 4 if rate < 100 else 2),
         })
     return result
 
 
-_HISTORY_CACHE: dict[str, list[dict[str, Any]]] = {}
-
-
 def _get_cached_history(currency: str) -> list[dict[str, Any]]:
+    """Get rate history — SQLite first, then mock fallback."""
+    # Try SQLite (live/backfilled data)
+    try:
+        from . import data_store
+        rows = data_store.query_fx_history(currency, days=30)
+        if rows and len(rows) >= 5:
+            return rows
+    except Exception:
+        pass
+
+    # Fallback to mock
     if currency not in _HISTORY_CACHE:
         info = _CURRENCIES.get(currency)
         if not info:
@@ -138,6 +324,7 @@ class FXRate:
     change_pct: float         # % change over 30 days (positive = USD strengthened)
     trend: str                # "usd_strengthening", "usd_weakening", "stable"
     trend_zh: str
+    source: str = "mock"      # "ecb", "exchangerate_api", "simulated", "mock"
 
     def as_dict(self) -> dict:
         return {
@@ -152,6 +339,7 @@ class FXRate:
             "change_30d_pct": round(self.change_pct, 2),
             "trend": self.trend,
             "trend_zh": self.trend_zh,
+            "source": self.source,
         }
 
 
@@ -179,6 +367,16 @@ def get_fx_rate(currency: str) -> FXRate | None:
     else:
         trend, trend_zh = "stable", "稳定"
 
+    # Determine data source
+    source = "mock"
+    try:
+        from . import data_store
+        latest = data_store.query_fx_latest(code)
+        if latest:
+            source = latest["source"]
+    except Exception:
+        pass
+
     return FXRate(
         currency=code,
         currency_name=info.name,
@@ -191,6 +389,7 @@ def get_fx_rate(currency: str) -> FXRate | None:
         change_pct=change_pct,
         trend=trend,
         trend_zh=trend_zh,
+        source=source,
     )
 
 

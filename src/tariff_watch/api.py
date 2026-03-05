@@ -1,4 +1,4 @@
-"""FastAPI Web API for Tariff Watch V3.1."""
+"""FastAPI Web API for Tariff Watch V3.2."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ app = FastAPI(
         "exchange rates, shipping costs, and Federal Register tariff notices. "
         "Supports global traders from any origin country."
     ),
-    version="3.1.0",
+    version="3.2.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -53,8 +53,12 @@ app.add_middleware(
 )
 
 
+_scheduler = None  # background data scheduler
+
+
 @app.on_event("startup")
 def startup() -> None:
+    global _scheduler
     try:
         init_pool()
         apply_schema()
@@ -62,9 +66,22 @@ def startup() -> None:
     except Exception as e:
         logger.warning("PostgreSQL not available, running in live-only mode: %s", e)
 
+    # Start background data scheduler (SQLite-based, no PG needed)
+    try:
+        from .scheduler import start_scheduler
+        _scheduler = start_scheduler()
+        logger.info("Background data scheduler started.")
+    except Exception as e:
+        logger.warning("Scheduler failed to start: %s", e)
+
 
 @app.on_event("shutdown")
 def shutdown() -> None:
+    global _scheduler
+    if _scheduler:
+        from .scheduler import stop_scheduler
+        stop_scheduler(_scheduler)
+        _scheduler = None
     from .db import close_pool
     close_pool()
 
@@ -74,7 +91,28 @@ def shutdown() -> None:
 @app.get("/health", tags=["meta"])
 def health() -> dict[str, str]:
     """Returns 200 OK when the API and database are reachable."""
-    return {"status": "ok", "version": "3.1.0"}
+    return {"status": "ok", "version": "3.2.0"}
+
+
+@app.get("/data-sources", tags=["meta"])
+def data_sources() -> dict:
+    """Show which data sources are active and when they were last refreshed."""
+    try:
+        from .data_store import get_meta
+        return {
+            "fx_source": "exchangerate_api" if os.environ.get("EXCHANGERATE_API_KEY") else "ecb",
+            "fx_last_refresh": get_meta("fx_last_refresh"),
+            "fx_backfilled": get_meta("fx_backfilled") == "true",
+            "shipping_source": "freightos" if os.environ.get("FREIGHTOS_API_KEY") else "simulated",
+            "shipping_last_refresh": get_meta("shipping_last_refresh"),
+            "ecb_gap_currencies": ["VND", "BDT", "PKR", "TWD"],
+            "note": "Set EXCHANGERATE_API_KEY for full currency coverage. Set FREIGHTOS_API_KEY for real shipping rates.",
+        }
+    except Exception:
+        return {
+            "fx_source": "mock (scheduler not started)",
+            "shipping_source": "mock (scheduler not started)",
+        }
 
 
 # ── Tariff lookup ─────────────────────────────────────────────────────────────

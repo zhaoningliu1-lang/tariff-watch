@@ -1,5 +1,5 @@
 """
-Country-of-origin tariff overlay — focused on China-origin exports to the US.
+Country-of-origin tariff overlay — supports global traders shipping to the US.
 
 Computes confirmed, currently-in-force additional duties stacked on top of
 the USITC base MFN rate:
@@ -76,9 +76,12 @@ _COUNTRY_DISPLAY: dict[str, str] = {
     "VN": "Vietnam", "VNM": "Vietnam", "VIETNAM": "Vietnam",
     "IN": "India", "IND": "India", "INDIA": "India",
     "BD": "Bangladesh", "BGD": "Bangladesh",
-    "DE": "Germany", "JP": "Japan", "KR": "South Korea",
+    "DE": "Germany", "FR": "France", "IT": "Italy", "ES": "Spain", "NL": "Netherlands",
+    "GB": "United Kingdom", "UK": "United Kingdom",
+    "JP": "Japan", "KR": "South Korea",
     "TH": "Thailand", "ID": "Indonesia", "MY": "Malaysia",
     "PH": "Philippines", "PK": "Pakistan",
+    "TW": "Taiwan", "BR": "Brazil", "TR": "Turkey",
 }
 
 

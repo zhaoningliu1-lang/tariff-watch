@@ -1,4 +1,4 @@
-"""FastAPI Web API for Tariff Watch V3."""
+"""FastAPI Web API for Tariff Watch V3.1."""
 
 from __future__ import annotations
 
@@ -22,6 +22,13 @@ from .antidumping import get_all_orders, get_orders_by_chapter, lookup_adcvd
 from .normalize import normalize_hts_code, parse_rate
 from .sources_usitc import fetch_live_rates
 from .tariff_overlay import compute_overlay
+from .sources_fx import calculate_fx_impact, get_all_fx_rates, get_fx_history, get_fx_rate
+from .sources_shipping import (
+    calculate_shipping_cost,
+    get_all_routes,
+    get_shipping_history,
+    get_shipping_rate,
+)
 from .trade_compliance import get_compliance_report, get_entry_requirements
 
 logger = logging.getLogger(__name__)
@@ -30,9 +37,10 @@ app = FastAPI(
     title="Tariff Watch API",
     description=(
         "Query current US HTS tariff rates, AD/CVD duties, trade compliance, "
-        "rate change history, and Federal Register tariff notices."
+        "exchange rates, shipping costs, and Federal Register tariff notices. "
+        "Supports global traders from any origin country."
     ),
-    version="3.0.0",
+    version="3.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -66,7 +74,7 @@ def shutdown() -> None:
 @app.get("/health", tags=["meta"])
 def health() -> dict[str, str]:
     """Returns 200 OK when the API and database are reachable."""
-    return {"status": "ok", "version": "3.0.0"}
+    return {"status": "ok", "version": "3.1.0"}
 
 
 # ── Tariff lookup ─────────────────────────────────────────────────────────────
@@ -355,6 +363,190 @@ def get_entry_costs(
     """
     entry = get_entry_requirements(origin=origin, estimated_value_usd=estimated_value_usd)
     return entry.as_dict()
+
+
+# ── Exchange Rates ───────────────────────────────────────────────────────────
+
+@app.get("/fx/rates", tags=["fx"])
+def fx_all_rates() -> list[dict]:
+    """Return current USD exchange rates for all tracked currencies with 30-day trends."""
+    return get_all_fx_rates()
+
+
+@app.get("/fx/{currency}", tags=["fx"])
+def fx_rate(
+    currency: str,
+) -> dict:
+    """
+    Get current USD exchange rate and 30-day trend for a currency.
+
+    Accepts currency codes (CNY, EUR, JPY) or country codes (CN, DE, JP).
+
+    **Example:** `/fx/CNY` or `/fx/CN`
+    """
+    rate = get_fx_rate(currency)
+    if not rate:
+        raise HTTPException(status_code=404, detail=f"Currency or country '{currency}' not found.")
+    return rate.as_dict()
+
+
+@app.get("/fx/{currency}/history", tags=["fx"])
+def fx_history(currency: str) -> list[dict]:
+    """Return 30-day daily exchange rate history."""
+    history = get_fx_history(currency)
+    if not history:
+        raise HTTPException(status_code=404, detail=f"No FX history for '{currency}'.")
+    return history
+
+
+@app.get("/fx/{currency}/impact", tags=["fx"])
+def fx_impact(
+    currency: str,
+    cog_local: float = Query(description="Cost of goods in local currency per unit"),
+    units: int = Query(default=100, ge=1, description="Number of units in shipment"),
+) -> dict:
+    """
+    Calculate the FX impact on your cost of goods over the last 30 days.
+
+    **Example:** `/fx/CNY/impact?cog_local=32&units=500`
+    """
+    impact = calculate_fx_impact(origin=currency, cog_local=cog_local, units=units)
+    if not impact:
+        raise HTTPException(status_code=404, detail=f"Currency or country '{currency}' not found.")
+    return impact.as_dict()
+
+
+# ── Shipping Rates ───────────────────────────────────────────────────────────
+
+@app.get("/shipping/routes", tags=["shipping"])
+def shipping_all_routes(
+    origin: str | None = Query(default=None, description="Filter by origin country code (e.g. 'CN', 'VN')"),
+) -> list[dict]:
+    """
+    Return current container shipping rates for all tracked routes to the US.
+
+    **Example:** `/shipping/routes?origin=CN`
+    """
+    return get_all_routes(origin=origin)
+
+
+@app.get("/shipping/{origin}", tags=["shipping"])
+def shipping_rate(
+    origin: str,
+    destination: str = Query(default="USWC", description="US destination: 'USWC' (West Coast) or 'USEC' (East Coast)"),
+) -> list[dict]:
+    """
+    Get current shipping rates from an origin country to a US coast.
+
+    **Example:** `/shipping/CN?destination=USWC`
+    """
+    rates = get_shipping_rate(origin, destination)
+    if not rates:
+        raise HTTPException(status_code=404, detail=f"No shipping routes found for origin '{origin}' to {destination}.")
+    return rates
+
+
+@app.get("/shipping/{origin}/history", tags=["shipping"])
+def shipping_history(
+    origin: str,
+    destination: str = Query(default="USWC", description="US destination: 'USWC' or 'USEC'"),
+) -> list[dict]:
+    """Return 30-day daily container rate history for a route."""
+    history = get_shipping_history(origin, destination)
+    if not history:
+        raise HTTPException(status_code=404, detail=f"No shipping history for '{origin}' to {destination}.")
+    return history
+
+
+@app.get("/shipping/{origin}/cost", tags=["shipping"])
+def shipping_cost(
+    origin: str,
+    destination: str = Query(default="USWC", description="'USWC' or 'USEC'"),
+    cbm: float = Query(default=1.0, ge=0.01, description="Total cubic meters of shipment"),
+    units: int = Query(default=100, ge=1, description="Number of product units"),
+) -> list[dict]:
+    """
+    Calculate shipping cost per unit for LCL, FCL 20ft, and FCL 40ft.
+
+    **Example:** `/shipping/CN/cost?destination=USWC&cbm=2.5&units=500`
+    """
+    costs = calculate_shipping_cost(origin, destination, cbm=cbm, units=units)
+    if not costs:
+        raise HTTPException(status_code=404, detail=f"No routes for '{origin}' to {destination}.")
+    return costs
+
+
+# ── Landed Cost (comprehensive) ─────────────────────────────────────────────
+
+@app.get("/landed-cost", tags=["landed-cost"])
+def landed_cost(
+    hts_code: str = Query(description="HTS code (e.g. '7604101000')"),
+    origin: str = Query(default="CN", description="Country of origin"),
+    cog_local: float = Query(description="Cost of goods in local currency per unit"),
+    units: int = Query(default=100, ge=1, description="Units per shipment"),
+    cbm: float = Query(default=1.0, ge=0.01, description="Total CBM of shipment"),
+    destination: str = Query(default="USWC", description="'USWC' or 'USEC'"),
+) -> dict:
+    """
+    **Comprehensive landed cost calculator** — combines tariff, FX, shipping,
+    and customs costs into a single per-unit cost estimate.
+
+    This is the main endpoint for any global trader asking:
+    "What does it actually cost me to land this product in the US?"
+
+    **Example:** `/landed-cost?hts_code=7604101000&origin=CN&cog_local=32&units=500&cbm=5&destination=USWC`
+    """
+    code = normalize_hts_code(hts_code)
+    if not code:
+        raise HTTPException(status_code=422, detail=f"Invalid HTS code: {hts_code!r}")
+
+    # 1. Tariff
+    base_pct, source = _lookup_base_rate(code)
+    overlay = compute_overlay(hts_code=code, origin=origin, base_rate_pct=base_pct)
+
+    # 2. FX
+    fx = calculate_fx_impact(origin=origin, cog_local=cog_local, units=units)
+    cog_usd = fx.cog_usd_current if fx else cog_local  # fallback if no FX data
+
+    # 3. Tariff amount
+    tariff_rate = overlay.effective_total_pct / 100.0
+    tariff_per_unit = round(cog_usd * tariff_rate, 2)
+
+    # 4. Shipping (cheapest option)
+    shipping_options = calculate_shipping_cost(origin, destination, cbm=cbm, units=units)
+    cheapest_shipping = min(shipping_options, key=lambda x: x["cost_per_unit_usd"]) if shipping_options else None
+    shipping_per_unit = cheapest_shipping["cost_per_unit_usd"] if cheapest_shipping else 0
+
+    # 5. Customs entry costs
+    shipment_value = cog_usd * units
+    entry = get_entry_requirements(origin=origin, estimated_value_usd=shipment_value)
+    customs_per_unit = round(entry.total_entry_costs_usd / max(units, 1), 2)
+
+    # 6. Total
+    total_per_unit = round(cog_usd + tariff_per_unit + shipping_per_unit + customs_per_unit, 2)
+
+    return {
+        "summary": {
+            "hts_code": code,
+            "origin": origin,
+            "origin_display": overlay.as_dict()["origin_display"],
+            "units": units,
+            "cog_local": cog_local,
+            "cog_usd": round(cog_usd, 2),
+            "tariff_per_unit_usd": tariff_per_unit,
+            "shipping_per_unit_usd": round(shipping_per_unit, 2),
+            "customs_per_unit_usd": customs_per_unit,
+            "total_landed_cost_per_unit_usd": total_per_unit,
+            "effective_tariff_pct": round(overlay.effective_total_pct, 2),
+        },
+        "tariff": overlay.as_dict(),
+        "fx": fx.as_dict() if fx else None,
+        "shipping": {
+            "recommended": cheapest_shipping,
+            "all_options": shipping_options,
+        },
+        "customs": entry.as_dict(),
+    }
 
 
 # ── Amazon Product Analytics ──────────────────────────────────────────────────

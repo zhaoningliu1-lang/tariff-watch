@@ -49,8 +49,7 @@ def close_pool() -> None:
 def get_conn() -> Generator[psycopg2.extensions.connection, None, None]:
     """Yield a connection from the pool, auto-commit or rollback on exit."""
     if _pool is None:
-        init_pool()
-    assert _pool is not None
+        raise RuntimeError("PostgreSQL pool not initialised (DB unavailable)")
     conn = _pool.getconn()
     try:
         yield conn
